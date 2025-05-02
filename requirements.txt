@@ -1,0 +1,6 @@
+APScheduler==3.11.0
+nba_api==1.9.0
+pandas==2.2.3
+python-dotenv==1.1.0
+Requests==2.32.3
+supabase==2.15.1
