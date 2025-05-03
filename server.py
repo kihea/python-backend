@@ -181,29 +181,8 @@ def get_game_data(season='2024-25'):
     print(f"Fetching game data for {season} season...")
     # Get live data first
     
-    # Get games for today
-    gamestoday = scoreboard.ScoreBoard().games.get_dict()
-    for game in gamestoday:
-        home_team = game["homeTeam"]["teamId"]
-        away_team = game["awayTeam"]["teamId"]
-        # See if game is in games table
-        response = (
-            supabase
-            .table('games')
-            .select('game_id')
-            .eq('home_team_id', home_team)
-            .eq('away_team_id', away_team)
-            .maybe_single()
-            .execute()
-        )
-        if response.data:
-            # Add game_id to games table as nba_api_game_id
-            game_id = response.data['game_id']
-            supabase.table('games').update({'nba_api_game_id': safe_int_cast(game['gameId']),'series_game_number': game['seriesGameNumber'], 'series_text': game['seriesText'] ,'period': game['period'], 'game_clock': game['gameClock'], 'status': game['gameStatusText'], 'home_score': game['homeTeam']['score'], 'away_score': game['awayTeam']['score']}).eq('game_id', game_id).execute()
-            pass
-        else:
-            continue
-    batch_size = 4000
+    
+    batch_size = 500
     offset = 0
     game_ids = []
     while True:
@@ -329,7 +308,7 @@ def get_game_data(season='2024-25'):
     
     # Go back to any rows in the database where wl == "0" or has_shot_data == False and retry data retrieval
 
-
+    
     return all_processed_data, bad_data_lines
 def clean_row(row):
     """Replace any NaN or None in the row with 0"""
@@ -729,6 +708,40 @@ def sync_active_odds_to_supabase():
                 # Send the payload to the endpoint
                 DontePicks(payload)
             upload_logs_to_supabase_bulk(list(props.values()), table_name="historical_odds")
+
+    gamestoday = scoreboard.ScoreBoard().games.get_dict()
+    for game in gamestoday:
+        home_team = game["homeTeam"]["teamId"]
+        away_team = game["awayTeam"]["teamId"]
+        # See if game is in games table
+        response = (
+            supabase
+            .table('games')
+            .select('game_id')
+            .eq('home_team_id', home_team)
+            .eq('away_team_id', away_team)
+            .limit(1)  # safely get the first result
+            .execute()
+        )
+        def safe_get(d, key, default=None):
+            return d.get(key, default) if isinstance(d, dict) else default
+        if response.data and len(response.data) > 0:
+            game_id = response.data[0]['game_id']
+            update_payload = {
+                'nba_api_game_id': game.get('gameId'),
+                'series_game_number': game.get('seriesGameNumber', 'N/A'),
+                'series_text': game.get('seriesText'),
+                'period': game.get('period'),
+                'game_clock': game.get('gameClock') or None,  # avoid empty string
+                'status': game.get('gameStatusText'),
+                'home_score': safe_get(game.get('homeTeam', {}), 'score'),
+                'away_score': safe_get(game.get('awayTeam', {}), 'score'),
+            }
+
+            clean_payload = {k: v for k, v in update_payload.items() if v is not None}
+            supabase.table('games').update(clean_payload).eq('game_id', game_id).execute()
+        else:
+            continue
 def sync_team_data_to_supabase():
     all_teams = teams.get_teams()
     
