@@ -805,7 +805,7 @@ import azure.functions as func
 
 app = func.FunctionApp()
 @app.function_name("run")
-@app.schedule(schedule="0 */1 * * *", arg_name="req", run_on_startup=True, use_monitor=False)
+@app.schedule(schedule="0 0 * * *", arg_name="req", run_on_startup=True, use_monitor=True)
 def run(req) -> None:
     """
     Azure Function Timer Trigger: runs every scheduled interval.
