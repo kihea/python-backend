@@ -26,7 +26,7 @@ class DontePicks:
     base_url = f"https://api-{os.getenv("RELEVANCE_REGION")}.stack.tryrelevance.com/latest"
     tool_id = os.getenv("RELEVANCE_TOOL_ID")
     headers={
-        "Authorization": os.getenv("RELEVANCE_PROJECT_ID") + ":" + os.getenv("RELEVANCE_API_KEY"),
+        "Authorization": os.getenv("RELEVANCE_AUTH_TOKEN"),
         "Content-Type": "application/json",
     }
     def __init__(self, payload):
@@ -465,14 +465,6 @@ nbateams_abbreviations = {
     "Washington Wizards": "WAS",
 }
 
-def getBookmakerLogo(bookmaker: str) -> str:
-    """
-    Returns the logo URL for a given bookmaker.
-    """
-    if bookmaker in bookmakerDomainMap:
-        return f"{bookmakerDomainMap[bookmaker]}?token={os.getenv('LOGO_TOKEN')}"
-    else:
-        return f"{bookmakerDomainMap[bookmaker]}?token={os.getenv("LOGO_TOKEN")}"  # Default logo URL
 
 def upload_headshot_from_url(headshot_url, bucket_name, file_name):
     # 1. Download the image
@@ -529,8 +521,7 @@ def sync_player_data_to_supabase():
         # Get the headshot URL
         headshot_url = getHeadshot(player_id)
         if headshot_url is None:
-            headshot_url = "https://img.logo.dev/nba.com?token=" + os.getenv("LOGO_TOKEN")  # Default image URL
-            continue
+            pass
         else:
             # Upload the image to Supabase storage bucket
             bucket_name = "headshots"
