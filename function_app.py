@@ -1,5 +1,7 @@
+import logging
 import math
 from typing import Dict, Any, List
+import concurrent.futures
 import pandas as pd
 import time
 import threading
@@ -740,6 +742,7 @@ def sync_active_odds_to_supabase():
 
             clean_payload = {k: v for k, v in update_payload.items() if v is not None}
             supabase.table('games').update(clean_payload).eq('game_id', game_id).execute()
+            
         else:
             continue
 def sync_team_data_to_supabase():
@@ -798,48 +801,36 @@ def adaptive_odds_loop():
         # 4. Sleep until next run
         time.sleep(interval)
 
+import azure.functions as func
 
-def main():
-    
+app = func.FunctionApp()
+@app.function_name("run")
+@app.schedule(schedule="0 */1 * * *", arg_name="req", run_on_startup=True, use_monitor=False)
+def run(req) -> None:
+    """
+    Azure Function Timer Trigger: runs every scheduled interval.
+    """
     start_time = datetime.now()
-    print(f"[Main] Data collection start: {start_time}")
+    logging.info(f"[Main] Data collection start: {start_time}")
 
-    import concurrent.futures
-    DontePicks.start_workers()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-        print("[Main] Running parallel tasks...")
-        futures = []
-        futures.append(executor.submit(sync_player_data_to_supabase))
-        futures.append(executor.submit(sync_team_data_to_supabase))
-        futures.append(executor.submit(get_game_data))
-        # We no longer call sync_active_odds here
-
-        # Wait for player & team tasks to finish
-        for f in futures:
-            f.result()
-    DontePicks.job_queue.join()
-    end_time = datetime.now()
-    print(f"[Main] Data collection completed in {end_time - start_time}")
-
-
-if __name__ == '__main__':
-    
-    # -- 1) Start APScheduler for `main` --
-    scheduler = BackgroundScheduler()
-    # Run `main` every 6 hours (adjust as needed)
-    scheduler.add_job(main, 'interval', hours=6, next_run_time=datetime.now())
-    scheduler.start()
-    print("Scheduler started: main() will run every 6 hours.")
-
-    # -- 2) Start adaptive odds loop in background thread --
-    odds_thread = threading.Thread(target=adaptive_odds_loop, daemon=True)
-    odds_thread.start()
-    print("Adaptive odds loop started in background thread.")
-
-    # -- 3) Keep the main thread alive
     try:
-        while True:
-            time.sleep(1)
-    except (KeyboardInterrupt, SystemExit):
-        scheduler.shutdown()
-        print("Shutting down scheduler.")
+        DontePicks.start_workers()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            logging.info("[Main] Running parallel tasks...")
+            futures = [
+                executor.submit(sync_player_data_to_supabase),
+                executor.submit(sync_team_data_to_supabase),
+                executor.submit(get_game_data),
+                executor.submit(sync_active_odds_to_supabase),  # Uncomment if needed
+            ]
+            for f in futures:
+                f.result()
+
+        DontePicks.job_queue_join()
+
+        end_time = datetime.now()
+        logging.info(f"[Main] Data collection completed in {end_time - start_time}")
+
+    except Exception as e:
+        logging.error(f"[Main Error] {e}")
