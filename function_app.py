@@ -1,10 +1,8 @@
 import logging
 import math
 from typing import Dict, Any, List
-import concurrent.futures
 import pandas as pd
 import time
-import threading
 import queue
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
@@ -23,101 +21,109 @@ supabase: Client = create_client(url, key)
 
 
 class DontePicks:
+    # simple FIFO queue
     job_queue = queue.Queue()
-    num_worker_threads = 5  # Adjust based on your system's capabilities
-    base_url = f"https://api-{os.getenv("RELEVANCE_REGION")}.stack.tryrelevance.com/latest"
-    tool_id = os.getenv("RELEVANCE_TOOL_ID")
-    headers={
+
+    base_url = f"https://api-{os.getenv('RELEVANCE_REGION')}.stack.tryrelevance.com/latest"
+    tool_id  = os.getenv("RELEVANCE_TOOL_ID")
+    headers  = {
         "Authorization": os.getenv("RELEVANCE_AUTH_TOKEN"),
-        "Content-Type": "application/json",
+        "Content-Type":  "application/json",
     }
-    def __init__(self, payload):
+    # supabase client
+    supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
+
+    def __init__(self, payload: dict):
         self.payload = payload
         self.job_id = None
+        # enqueue
         DontePicks.job_queue.put(self)
 
-    def do(self):
-        if self.job_id is not None:
+    def do(self) -> str:
+        """Trigger the async job and store job_id."""
+        if self.job_id:
             return self.job_id
-        response = requests.post(
-            DontePicks.base_url + f"/studios/{DontePicks.tool_id}/trigger_async",
+        resp = requests.post(
+            f"{DontePicks.base_url}/studios/{DontePicks.tool_id}/trigger_async",
             headers=DontePicks.headers,
-            json={
-                "params": self.payload,
-                "project": os.getenv("RELEVANCE_PROJECT_ID"),
-            },
+            json={"params": self.payload,
+                  "project": os.getenv("RELEVANCE_PROJECT_ID")},
         )
-        if response.status_code != 200:
-            print(f"Error: {response.status_code} - {response.text}")
-            return None
-        job = response.json()
-        self.job_id = job.get("job_id")
+        resp.raise_for_status()
+        self.job_id = resp.json()["job_id"]
         return self.job_id
 
-    def poll(self):
-        if self.job_id is None:
-            return None
-        while True:
-            response = requests.get(
-                DontePicks.base_url + f"/studios/{DontePicks.tool_id}/async_poll/{self.job_id}?ending_update_only=true",
-                headers=DontePicks.headers
-            )
-            if response.status_code != 200:
-                print(f"Error with player analysis: {response.status_code} - {response.text}")
-                time.sleep(5)
-                continue
-            job = response.json()
-            
-            if job["type"] == "complete":
-                for step in job["updates"]:
-                    if step["type"] == "chain-success":
-                        job = step['output']['output']['output']
-                        picks = job["picks"]
-                        picks = [
-                            {
-                                "prop_id": pick["prop_id"],
-                                "donte_projection": pick["estimated_projection"],
-                                "donte_confidence": pick["confidence"],
-                                "donte_analysis": pick["analysis"],
-                                "donte_considerations": pick["considerations"],
-                                "donte_decision": pick["decision"],
-                            } for pick in picks
-                        ]
-                        # Remove any duplicates
-                        seen_ids = set()
-                        unique_picks = []
-                        for pick in picks:
-                            if pick["prop_id"] not in seen_ids:
-                                seen_ids.add(pick["prop_id"])
-                                unique_picks.append(pick)
+    def poll(self, interval: float = 3.0, timeout: float = 300.0) -> dict:
+        """
+        Poll until complete or failed. Returns the final job JSON
+        on success, raises on failure or timeout.
+        """
+        if not self.job_id:
+            raise RuntimeError("Cannot poll before triggering a job")
 
-                        picks = unique_picks
-                        supabase.table("historical_odds").upsert(picks).execute()
-                        break
-                return job 
-            elif job["type"] == "failed":
-                print(f"Job failed: {job['job_id']}")
-                return None
-            else:
-                time.sleep(3)
+        start = time.time()
+        while True:
+            if time.time() - start > timeout:
+                raise TimeoutError(f"Job {self.job_id} timed out after {timeout}s")
+
+            resp = requests.get(
+                f"{DontePicks.base_url}/studios/{DontePicks.tool_id}/async_poll/{self.job_id}"
+                "?ending_update_only=true",
+                headers=DontePicks.headers,
+            )
+            resp.raise_for_status()
+            job = resp.json()
+
+            if job["type"] == "complete":
+                return job
+            if job["type"] == "failed":
+                raise RuntimeError(f"Job {self.job_id} failed")
+            time.sleep(interval)
 
     @classmethod
-    def worker(cls):
-        while True:
-            donte_pick = cls.job_queue.get()
+    def extract_and_store(cls, job: dict) -> list:
+        """
+        Finds the chain-success update, transforms + dedupes,
+        then upserts into Supabase.
+        """
+        for step in job.get("updates", []):
+            if step.get("type") == "chain-success":
+                out = step["output"]["output"]["output"]
+                raw = out.get("picks", [])
+                seen = set()
+                clean = []
+                for p in raw:
+                    pid = p["prop_id"]
+                    if pid in seen:
+                        continue
+                    seen.add(pid)
+                    clean.append({
+                        "prop_id":              pid,
+                        "donte_projection":     p["estimated_projection"],
+                        "donte_confidence":     p["confidence"],
+                        "donte_analysis":       p["analysis"],
+                        "donte_considerations": p["considerations"],
+                        "donte_decision":       p["decision"],
+                    })
+                cls.supabase.table("historical_odds").upsert(clean).execute()
+                return clean
+        raise ValueError("No chain-success output found in job updates")
+
+    @classmethod
+    def flush(cls):
+        """
+        Process every enqueued DontePicks, one by one, synchronously.
+        """
+        while not cls.job_queue.empty():
+            task: DontePicks = cls.job_queue.get()
             try:
-                donte_pick.do()
-                donte_pick.poll()
+                task.do()
+                job = task.poll()
+                cls.extract_and_store(job)
+            except Exception as e:
+                print(f"[DontePicks] error on payload {task.payload}: {e}")
             finally:
                 cls.job_queue.task_done()
-
-    @classmethod
-    def start_workers(cls):
-        for _ in range(cls.num_worker_threads):
-            t = threading.Thread(target=cls.worker)
-            t.daemon = True
-            t.start()
-
 min_sleep = 0.1  # Minimum sleep time in seconds
 sleep_time = min_sleep
 def safe_api_call(api_function, max_retries=2, max_sleep=12, tracking=None, dataFrame=True,**kwargs) -> list | dict:
@@ -814,20 +820,13 @@ def run(req) -> None:
     logging.info(f"[Main] Data collection start: {start_time}")
 
     try:
-        DontePicks.start_workers()
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-            logging.info("[Main] Running parallel tasks...")
-            futures = [
-                executor.submit(sync_player_data_to_supabase),
-                executor.submit(sync_team_data_to_supabase),
-                executor.submit(get_game_data),
-                executor.submit(sync_active_odds_to_supabase),  # Uncomment if needed
-            ]
-            for f in futures:
-                f.result()
-
-        DontePicks.job_queue_join()
+        sync_player_data_to_supabase()
+        sync_team_data_to_supabase()
+        get_game_data()
+        sync_active_odds_to_supabase()
+            
+        DontePicks.flush()
 
         end_time = datetime.now()
         logging.info(f"[Main] Data collection completed in {end_time - start_time}")
